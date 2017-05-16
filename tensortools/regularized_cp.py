@@ -7,49 +7,97 @@ import numpy as np
 from tqdm import trange
 from scipy.optimize import check_grad
 
-def nucnorm(matrix, penalty):
-    """Calculates the nuclear norm of a matrix
-    """
-    if penalty <= 0:
-        return 0.0
-    else:
-        s = np.linalg.svd(matrix, compute_uv=False)
-        return np.sum(np.abs(s))
+## Penalty functions ##
 
-def prox_nucnorm(matrix, lr, penalty):
+def no_penalty(x, scale):
+    """No penalty operator
+    """
+    return 0.0
+
+def l1(x, scale):
+    """Calculates l1 norm of a matrix `x`
+    """
+    return scale * np.sum(np.abs(x))
+
+def nucnorm(x, scale):
+    """Calculates the nuclear norm of a matrix `x`
+    """
+    s = np.linalg.svd(x, compute_uv=False)
+    return np.sum(np.abs(s))
+
+## Proximal operators ##
+
+def prox_no_penalty(x, lr, scale):
+    """No penalty prox operator
+    """
+    return x
+
+def prox_l1(x, lr, scale):
+    """Proximal operator for L1 regularization
+    """
+    lmbda = penalty * lr
+    return (x - lmbda) * (x >= lmbda) + (x + lmbda) * (x <= -lmbda)
+
+def prox_nonneg_l1(x, lr, scale):
+    """Proximal operator for L1 regularization and nonnegativity constraint
+    """
+    return np.maximum(0, x - lr * scale)
+
+
+def prox_nucnorm(x, lr, scale):
     """Proximal operater on the nuclear norm of a matrix.
     """
-    if penalty <= 0:
-        return matrix
-    else:
-        u, s, v = np.linalg.svd(matrix, full_matrices=False)
-        sthr = np.maximum(s - (penalty * lr), 0)
-        return np.dot(u*sthr, v)
+    u, s, v = np.linalg.svd(x, full_matrices=False)
+    sthr = np.maximum(s - (scale * lr), 0)
+    return np.dot(u*sthr, v)
 
-def lowrank_cpfit(tensor, rank, penalties, niter=1000, lr=1.0):
-    """CP decomposition with a nuclear norm constraint on the factor matrices
+def prox_nonneg_nucnorm(x, lr, scale):
+    """Proximal operator for nuclear norm regularization with nonnegativity constraint
+    """
+    return np.maximum(0, prox_nucnorm(x, lr, scale))
+
+def sparse_cpfit(tensor, rank, penalty_scales, penalize_l1=None,
+                 penalize_nucnorm=None,  niter=1000, lr=1.0,
+                 nonneg=False, factors=None):
+    """CP decomposition with L1 penalty on the factor matrices
     """
 
     # check inputs
-    if not np.iterable(penalties) or len(penalties) != tensor.ndim:
-        raise ValueError('Penalties should be specified as a list, matching the number of factor matrices.')
-    penalties = np.array(penalties)
+    if penalize_l1 is None:
+        penalize_l1 = [False for _ in range(tensor.ndim)]
+    else:
+        assert np.iterable(penalize_l1)
+        assert len(penalize_l1) == tensor.ndim
+
+    if not np.iterable(penalty_scales) or len(penalty_scales) != tensor.ndim:
+        raise ValueError('Penalties should be specified as a list.')
+    penalty_scales = np.array(penalty_scales)
 
     # initialize factors
-    factors = [np.random.randn(s, rank) for s in tensor.shape]
-    nucnorms = [nucnorm(fctr, p) for fctr, p in zip(factors, penalties)]
-    
+    if factors is None and nonneg:
+        factors = [np.random.rand(s, rank) for s in tensor.shape]
+    elif factors is None:
+        factors = [np.random.randn(s, rank) for s in tensor.shape]
+
+    # initialize penalties
+    for mode in range(tensor.ndim):
+        # initialize penalty functions
+
+    penalty_funcs = [l1 if s > 0 else no_penalty for s in penalty_scales]
+    penalties = np.array([f(fctr, s) for fctr, f, s in zip(factors, penalty_funcs, penalty_scales)])
+
+    # proximal operator
+    _op = prox_nonneg_l1 if nonneg else prox_l1
+    prox_ops = [_op if s > 0 else prox_no_penalty for s in penalty_scales]
     loss_hist = []
     obj_hist = []
-    nrm = 1 / np.prod(tensor.shape)
 
     for i in range(niter):
-
+        
         factor_cache = [fctr.copy() for fctr in factors]
 
-        # alternating optimization over modes
-        for mode in range(tensor.ndim):
-
+        for mode in range(tensor.ndim):        
+            
             # form unfolding and khatri-rao product
             A = unfold(tensor, mode)
             B = khatri_rao(factors, skip_matrix=mode).T
@@ -57,27 +105,26 @@ def lowrank_cpfit(tensor, rank, penalties, niter=1000, lr=1.0):
 
             # compute gradient with respect to X
             loss = 0.5*np.mean((A - X.dot(B))**2)
-            grad = nrm * (X.dot(B).dot(B.T) - A.dot(B.T))
+            grad = (1 / np.prod(tensor.shape)) * (X.dot(B).dot(B.T) - A.dot(B.T))
             
-            # save loss
+            # keep history of loss
             loss_hist.append(loss)
-            obj_hist.append(loss + np.sum(nucnorms))
+            obj_hist.append(loss + np.sum(l1norms))
 
-            # # backtracking line search
-            # while 0.5*np.sum((A - (X - lr*grad).dot(B))**2) > loss:
-            #     lr *= 0.1
+            # apply proximal gradient step
+            factors[mode] = prox_ops[mode](X - lr*grad, lr, penalties[mode])
 
-            # update params
-            factors[mode] = prox_nucnorm(X - lr*grad, lr, penalties[mode])
-            nucnorms[mode] = nucnorm(factors[mode], penalties[mode])
-        
+            # update 
+            penalties[mode] = penalty_funcs[mode](factors[mode], penalty_scales[mode])
+
         if loss_hist[-1] > loss_hist[-tensor.ndim]:
             lr *= 0.1
             factors = factor_cache
+            loss_hist = loss_hist[:-tensor.ndim]
+            obj_hist = loss_hist[:-tensor.ndim]
         else:
             lr *= 1.1
 
-        # renormalize factors
         factors = standardize_factors(factors, sort_factors=False)
 
     return factors, {'loss_hist': loss_hist, 'obj_hist': obj_hist}
